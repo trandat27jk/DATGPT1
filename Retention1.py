@@ -1,27 +1,58 @@
 import inspect
 import math
+import os
 import time
 
 import tiktoken
 import torch
+import torch._dynamo
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.distributed import destroy_process_group, init_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from dataloader import DataLoaderLite
 from RMSNorm import RMSNorm
 
-B = 8
-T = 32
+torch._dynamo.config.suppress_errors = True
+
+ddp = int(os.environ.get("RANK", -1)) != -1
+
+if ddp:
+    assert torch.cuda.is_available()
+    init_process_group(backend="nccl")
+    ddp_rank = int(os.environ["RANK"])
+    ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    ddp_world_size = int(os.environ["WORLD_SIZE"])
+    device = f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0
+else:
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    device = "cpu"
+
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using deivce: {device}")
+
+
+total_batch_size = 409600
+B = 16
+T = 64
 dataloader = DataLoaderLite(B, T, "input.txt")
-
-device = "cpu"
-
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
-print(f"using deivce: {device}")
+assert total_batch_size % (B * T * ddp_world_size) == 0
+grad_accum_steps = int(total_batch_size // (B * T * ddp_world_size))
+if master_process:
+    print(f"total desired batch size:{total_batch_size}")
+    print(f"=> caculated gradient accumulation steps:{grad_accum_steps}")
+print("I am gpu", ddp_rank)
 
 
 class RetnetConfig:
@@ -290,6 +321,7 @@ max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 275
 max_steps = 25000
+device_type = "cuda" if device.startswith("cuda") else "cpu"
 
 
 def get_lr(it):
@@ -305,31 +337,47 @@ def get_lr(it):
 
 torch.set_float32_matmul_precision("high")
 model = RetNet(config=RetnetConfig).to(device)
-# model = torch.compile(model)
-
-
+model = torch.compile(model)
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model
 parameters = sum(p.numel() for p in model.parameters())
 print(parameters)
-optimizer = model.configure_optimizers(
+optimizer = raw_model.configure_optimizers(
     weight_decay=0.05, learning_rate=6e-4, betas=(0.9, 0.98), device_type=device
 )
 for i in range(1000):
     t0 = time.time()
-    train, target = dataloader.next_batch()
-    train = train.to(device)
-    target = target.to(device)
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(train, target=target, training_mode=True)
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = dataloader.next_batch()
+        x, y = x.to(device), y.to(device)
+
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            logits, loss = model(x, target=y, training_mode=True)
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        if ddp:
+            model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+        loss.backward()
+
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(i)
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
-    loss.backward()
+
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000
-    tokens_per_sec = (dataloader.B * dataloader.T) / (t1 - t0)
-    print(
-        f"loss: {loss.item()} lr:{lr:.6f} dt:{dt:.2f}ms token per sec {tokens_per_sec}"
-    )
+    tokens_processsed = dataloader.B * dataloader.T * grad_accum_steps
+    tokens_per_sec = tokens_processsed / dt
+    if master_process:
+        print(
+            f"loss: {loss_accum.item()} lr:{lr:.6f} dt:{dt:.2f}ms token per sec {tokens_per_sec}"
+        )
+if ddp:
+    destroy_process_group()
